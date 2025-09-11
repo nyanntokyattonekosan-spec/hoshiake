@@ -1,0 +1,6 @@
+flask
+discord.py          # v2 系 (message content intent を有効にする)
+torch               # 学習に使う (環境に合わせてバージョン)
+numpy
+sentencepiece       # 将来的に使う場合
+python-dotenv       # ローカルで env 読むなら

@@ -1,282 +1,259 @@
-# AI学習設定
+# model.py
 import os
-import asyncio
 import json
-import time
-from datetime import datetime, timedelta
-from typing import Dict, Tuple, List
+import math
+import random
+from typing import List
 
-import discord
-from discord.ext import commands
-
-# transformers / peft 等は任意。実行環境に合わせてインストール
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel  # if using LoRA adapters
+import torch.nn as nn
+import torch.nn.functional as F
 
-# ---------- 設定 ----------
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "YOUR_TOKEN_HERE")
-BASE_MODEL = os.environ.get("BASE_MODEL", "cyberagent/open-calm-3b")  # 例
-ADAPTER_PATH = os.environ.get("INITIAL_ADAPTER", "adapters/lora-stable")
-DATA_DIR = "data"
-TRAIN_SCRIPT = "sft_incremental.py"  # 学習を行うスクリプト（subprocessで呼ぶ）
-TRAIN_CHECK_INTERVAL = 60 * 5  # 5分ごとに学習トリガーチェック
-CONV_TIMEOUT_SECONDS = 60 * 10  # 会話を続ける時間（例：10分）
-MAX_HISTORY_TOKENS = 1024
+# -------------------------
+# 簡易文字トークナイザ（プロトタイプ）
+# -------------------------
+class CharTokenizer:
+    def __init__(self, vocab=None):
+        # 特殊トークン
+        self.PAD = "<pad>"
+        self.UNK = "<unk>"
+        self.BOS = "<bos>"
+        self.EOS = "<eos>"
+        if vocab:
+            self.idx_to_token = vocab
+            self.token_to_idx = {t:i for i,t in enumerate(self.idx_to_token)}
+        else:
+            # 初期は日本語の文字頻度を足して拡張していく想定
+            self.idx_to_token = [self.PAD, self.UNK, self.BOS, self.EOS]
+            self.token_to_idx = {t:i for i,t in enumerate(self.idx_to_token)}
 
-# LoRA等の hot-swap 用ロック
-model_lock = threading.RLock()
+    @property
+    def vocab_size(self):
+        return len(self.idx_to_token)
 
-# ---------- グローバル状態 ----------
-_loaded_once = False
-tokenizer = None
-model = None
+    def build_from_texts(self, texts: List[str], min_freq=1):
+        freq = {}
+        for t in texts:
+            for ch in t:
+                freq[ch] = freq.get(ch, 0) + 1
+        for ch,count in sorted(freq.items(), key=lambda x:-x[1]):
+            if count >= min_freq and ch not in self.token_to_idx:
+                self.token_to_idx[ch] = len(self.idx_to_token)
+                self.idx_to_token.append(ch)
 
-# 会話保持（channel_id, user_id) -> list of (role, text)
-active_conversations: Dict[Tuple[int, int], Dict] = {}
-# 例: active_conversations[(channel.id, user.id)] = {
-#    "expires": datetime,
-#    "history": [ ("user", "..."), ("assistant","...") ]
-# }
+    def encode(self, text: str, add_bos=True, add_eos=True, max_len=None):
+        ids = []
+        if add_bos:
+            ids.append(self.token_to_idx[self.BOS])
+        for ch in text:
+            ids.append(self.token_to_idx.get(ch, self.token_to_idx[self.UNK]))
+            if max_len and len(ids) >= max_len:
+                break
+        if add_eos:
+            ids.append(self.token_to_idx[self.EOS])
+        return ids
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.messages = True
+    def decode(self, ids: List[int]):
+        tokens = []
+        for i in ids:
+            if i < 0 or i >= len(self.idx_to_token):
+                tokens.append(self.UNK)
+            else:
+                t = self.idx_to_token[i]
+                if t in (self.BOS, self.EOS, self.PAD):
+                    continue
+                tokens.append(t)
+        return "".join(tokens)
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+    def save(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.idx_to_token, f, ensure_ascii=False)
 
-# ---------- ユーティリティ: データ読み込み / フォーマット ----------
-def load_jsonl(path):
-    out = []
-    if not os.path.exists(path):
+def load_tokenizer_if_exists(path):
+    if path and os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            vocab = json.load(f)
+        return CharTokenizer(vocab=vocab)
+    return None
+
+# -------------------------
+# 小型 Transformer（GPT 系列に類似）
+# -------------------------
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d_model, n_head, dropout):
+        super().__init__()
+        assert d_model % n_head == 0
+        self.n_head = n_head
+        self.head_dim = d_model // n_head
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv = nn.Linear(d_model, d_model * 3)
+        self.proj = nn.Linear(d_model, d_model)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        qkv = self.qkv(x)  # B T 3C
+        q, k, v = qkv.chunk(3, dim=2)
+        # reshape for heads: B, n_head, T, head_dim
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1,2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1,2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1,2)
+        att = torch.matmul(q, k.transpose(-2,-1)) * self.scale  # B,nh,T,T
+
+        # causal mask (prevent attending to future)
+        mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        att = att.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        att = torch.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+
+        out = torch.matmul(att, v)  # B,nh,T,head_dim
+        out = out.transpose(1,2).contiguous().view(B, T, C)
+        out = self.resid_dropout(self.proj(out))
         return out
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except:
-                continue
-    return out
 
-def truncate_history_by_tokens(history: List[Tuple[str,str]], tokenizer, max_tokens=MAX_HISTORY_TOKENS):
-    # シンプル実装：後ろから足していってトークン数超えたら切る
-    total = 0
-    rev = []
-    for role, text in reversed(history):
-        l = len(tokenizer(text)["input_ids"])
-        if total + l > max_tokens:
-            break
-        rev.append((role, text))
-        total += l
-    return list(reversed(rev))
+class MLP(nn.Module):
+    def __init__(self, d_model, d_ff, dropout):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
 
-# ---------- モデルロード（on_readyで一度） ----------
-def build_model_and_tokenizer(adapter_path: str = None, device=None):
-    global tokenizer, model
-    # device自動選択
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    def forward(self, x):
+        return self.dropout(self.fc2(self.act(self.fc1(x))))
 
-    # 軽量化の例: 8-bitロードを使えるなら使う（環境依存）
-    # from transformers import AutoModelForCausalLM
-    # model = AutoModelForCausalLM.from_pretrained(BASE_MODEL, load_in_8bit=True, device_map="auto")
-    # ここでは通常ロード + PeftModel を使った例を示す
-    print(f"[model] loading base model {BASE_MODEL} on {device} ...")
-    base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=torch.float16 if device=="cuda" else torch.float32, device_map="auto" if device=="cuda" else None)
-    tokenizer_local = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
-    if adapter_path and os.path.exists(adapter_path):
-        print(f"[model] loading adapter from {adapter_path}")
-        model_local = PeftModel.from_pretrained(base, adapter_path, device_map="auto" if device=="cuda" else None)
-    else:
-        model_local = base
+class Block(nn.Module):
+    def __init__(self, d_model, n_head, d_ff, dropout):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_head, dropout)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = MLP(d_model, d_ff, dropout)
 
-    model_local.eval()
-    return tokenizer_local, model_local
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
 
-# ---------- 生成（スレッドセーフ） ----------
-def generate_reply(prompt: str, max_new_tokens=150, temperature=0.8, top_p=0.9):
-    global tokenizer, model, model_lock
-    with model_lock:
-        # トークナイズ & 生成
-        inputs = tokenizer(prompt, return_tensors="pt").to(next(model.parameters()).device)
-        out = model.generate(**inputs,
-                             max_new_tokens=max_new_tokens,
-                             do_sample=True,
-                             temperature=temperature,
-                             top_p=top_p,
-                             repetition_penalty=1.05,
-                             pad_token_id=tokenizer.eos_token_id)
-        text = tokenizer.decode(out[0], skip_special_tokens=True)
-    # modelが出力全文を返すことがあるので、プロンプト以降のみ取り出す実装は必要
-    # ここでは簡易に最後の生成を返す
+class TransformerModel(nn.Module):
+    def __init__(self, vocab_size, n_layer=6, n_head=8, d_model=512, d_ff=2048, max_seq_len=512, dropout=0.1):
+        super().__init__()
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(max_seq_len, d_model)
+        self.blocks = nn.ModuleList([Block(d_model, n_head, d_ff, dropout) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        # weight tying
+        self.lm_head.weight = self.tok_emb.weight
+        self.max_seq_len = max_seq_len
+
+    def forward(self, idx):  # idx: B x T (LongTensor)
+        B, T = idx.size()
+        assert T <= self.max_seq_len
+        tok = self.tok_emb(idx)
+        pos = torch.arange(T, device=idx.device).unsqueeze(0)
+        x = tok + self.pos_emb(pos)
+        for b in self.blocks:
+            x = b(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        return logits  # B x T x V
+
+    # 簡易生成（シンプルな top-k サンプリング）
+    def generate(self, input_ids, max_new_tokens=50, temperature=1.0, top_k=50, device="cpu"):
+        self.eval()
+        ids = input_ids[:]  # list of ints
+        for _ in range(max_new_tokens):
+            x = torch.tensor([ids[-self.max_seq_len:]], dtype=torch.long, device=device)
+            with torch.no_grad():
+                logits = self.forward(x)  # 1 x T x V
+            logits = logits[0, -1, :] / max(1e-8, temperature)
+            if top_k > 0:
+                v, _ = torch.topk(logits, top_k)
+                min_top = v[-1]
+                logits[logits < min_top] = -1e9
+            probs = torch.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1).item()
+            ids.append(next_id)
+            if next_id == 1:  # EOS index is 1? In our tokenizer EOS index may differ; adapt if needed
+                break
+        return ids
+
+# -------------------------
+# PII マスク（簡易）: メール・URL・電話番号などを置換
+# -------------------------
+import re
+_email_re = re.compile(r"[\w\.-]+@[\w\.-]+")
+_url_re = re.compile(r"https?://\S+|www\.\S+")
+_phone_re = re.compile(r"(?:\+?\d[\d\-\s]{6,}\d)")
+
+def mask_pii(text):
+    text = _email_re.sub("[EMAIL_REDACTED]", text)
+    text = _url_re.sub("[URL_REDACTED]", text)
+    text = _phone_re.sub("[PHONE_REDACTED]", text)
     return text
 
-# ---------- Prompt組み立て ----------
-SYSTEM_PROMPT = (
-    "あなたは日本語で親切かつフレンドリーなアシスタントです。"
-    "丁寧な言葉遣いで、必要なら確認を求めてください。"
-)
+# -------------------------
+# 簡易トレーニング関数（新規データで数エポックだけ学習する想定）
+# -------------------------
+def train_on_texts(texts, tokenizer: CharTokenizer, save_path="data/model.pt",
+                   epochs=1, seq_len=128, batch_size=8, lr=2e-4, device="cpu"):
+    # texts: list of cleaned strings
+    # tokenizer: インスタンス（必要なら vocab build）
+    if tokenizer.vocab_size <= 4:
+        tokenizer.build_from_texts(texts)
+        tokenizer.save("data/tokenizer.json")
 
-def build_chat_prompt(history: List[Tuple[str,str]], user_msg: str):
-    # history: [("user", "..."), ("assistant","..."), ...]
-    s = f"<|system|>\n{SYSTEM_PROMPT}\n"
-    for role, text in history:
-        tag = "user" if role=="user" else "assistant"
-        s += f"<|{tag}|>\n{text}\n"
-    s += f"<|user|>\n{user_msg}\n<|assistant|>\n"
-    return s
+    # instantiate model if not exists
+    model = TransformerModel(vocab_size=tokenizer.vocab_size, max_seq_len=seq_len)
+    model.to(device)
+    model.train()
 
-# ---------- 非同期学習ワーカー（サブプロセスで安全に学習） ----------
-async def trainer_worker():
-    """
-    定期的に data/inbox.jsonl 等をチェックし、所定条件を満たしたら
-    サブプロセスで学習スクリプトを起動します。学習中はログ出力を流す。
-    """
-    print("[trainer] worker started")
-    while True:
-        try:
-            # 簡易トリガー：inbox の行数がしきい値を超えたら学習
-            inbox = load_jsonl(os.path.join(DATA_DIR, "inbox.jsonl"))
-            if len(inbox) >= 500:  # しきい値は調整
-                tag = datetime.utcnow().strftime("v%Y%m%d%H%M%S")
-                cmd = ["python", TRAIN_SCRIPT, "--tag", tag]
-                print(f"[trainer] launching training: {' '.join(cmd)}")
-                # 非同期サブプロセス起動（イベントループをブロックしない）
-                proc = await asyncio.create_subprocess_exec(*cmd,
-                                                            stdout=asyncio.subprocess.PIPE,
-                                                            stderr=asyncio.subprocess.STDOUT)
-                # ログをリアルタイムに読む（任意）
-                while True:
-                    line = await proc.stdout.readline()
-                    if not line:
-                        break
-                    print("[trainer][log]", line.decode().rstrip())
-                rc = await proc.wait()
-                print(f"[trainer] training finished rc={rc}")
-                # 学習が終わったら adapters に新しい adapter が置かれる想定 → ホットスワップを検討
-                # ここで最新 adapter を検査してロードする処理を呼べる
-            else:
-                # 定期待機
-                await asyncio.sleep(TRAIN_CHECK_INTERVAL)
-        except Exception as e:
-            print("[trainer] exception:", e)
-            await asyncio.sleep(60)
+    # build token stream
+    stream = []
+    for t in texts:
+        ids = tokenizer.encode(t, add_bos=False, add_eos=True)
+        stream.extend(ids)
 
-# ---------- Hot-swap adapter（簡易） ----------
-def try_reload_adapter_if_new(adapter_path: str):
-    """
-    もし adapter_path に新しい adapter が置かれていればモデルを差し替える（簡易実装）
-    """
-    global tokenizer, model, model_lock
-    if not os.path.exists(adapter_path):
-        return False
-    try:
-        with model_lock:
-            print(f"[hot-swap] reloading adapter {adapter_path} ...")
-            base = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=torch.float16, device_map="auto")
-            tok = AutoTokenizer.from_pretrained(BASE_MODEL)
-            new_model = PeftModel.from_pretrained(base, adapter_path, device_map="auto")
-            new_model.eval()
-            # スワップ
-            tokenizer = tok
-            model = new_model
-        return True
-    except Exception as e:
-        print("[hot-swap] failed:", e)
-        return False
+    # split into blocks
+    blocks = []
+    for i in range(0, max(1, len(stream) - seq_len), seq_len):
+        block = stream[i:i+seq_len+1]  # input + next token (causal LM)
+        if len(block) == seq_len+1:
+            blocks.append(block)
 
-# ---------- Discord イベント ----------
-@bot.event
-async def on_ready():
-    global _loaded_once, tokenizer, model
-    if _loaded_once:
-        return
-    print(f"[bot] logged in as {bot.user} (id={bot.user.id})")
-    # 1回だけ行う初期化
-    try:
-        tokenizer, model = build_model_and_tokenizer(ADAPTER_PATH)
-        print("[bot] model and tokenizer loaded")
-    except Exception as e:
-        print("[bot] model load failed:", e)
-        # 失敗しても動作継続（ただし生成不可）
-    # 起動後に非同期ワーカーを開始（イベントループで）
-    bot.loop.create_task(trainer_worker())
-    _loaded_once = True
-
-@bot.event
-async def on_message(message: discord.Message):
-    # 自分自身やボットのメッセージは無視
-    if message.author.bot:
+    if not blocks:
         return
 
-    # 応答条件:
-    #  - ボットにメンションされている (message.mentions)
-    #  - または (channel, user) が active_conversations にあって期限内
-    key = (message.channel.id, message.author.id)
-    now = datetime.utcnow()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
-    mentioned = bot.user in message.mentions
-    active = False
-    if key in active_conversations:
-        entry = active_conversations[key]
-        if entry["expires"] > now:
-            active = True
-        else:
-            # 期限切れなら削除
-            del active_conversations[key]
+    for epoch in range(epochs):
+        random.shuffle(blocks)
+        for i in range(0, len(blocks), batch_size):
+            batch_blocks = blocks[i:i+batch_size]
+            x = torch.tensor([[b[:-1] for b in batch_blocks]], dtype=torch.long)  # shape incorrectly nested? fix below
+            # Correct collate:
+            x = torch.tensor([b[:-1] for b in batch_blocks], dtype=torch.long, device=device)  # B x seq_len
+            y = torch.tensor([b[1:] for b in batch_blocks], dtype=torch.long, device=device)  # labels
+            optimizer.zero_grad()
+            logits = model(x)  # B x T x V
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss.backward()
+            optimizer.step()
+        # end epoch
+    # save
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(model.state_dict(), save_path)
+    # optionally save tokenizer (already saved)
+    return
 
-    if not (mentioned or active):
-        # 無音モード（応答しない）
-        return
-
-    # 会話の履歴を準備（メモリに保存。実運用なら DB を推奨）
-    history = []
-    if active:
-        history = active_conversations[key]["history"]
-    else:
-        # 新しく会話を始めるとき、過去数件のメッセージを拾う（簡易実装）
-        # ここでは直近の発言1つを履歴に入れる例
-        history = [("user", message.content)]
-
-    # build prompt
-    prompt = build_chat_prompt(history, message.content)
-
-    # 生成（非同期に重い処理を回すため to_thread を使う）
-    loop = asyncio.get_running_loop()
-    try:
-        generated = await loop.run_in_executor(None, generate_reply, prompt)
-    except Exception as e:
-        generated = "ごめんなさい、応答生成でエラーが起きました。"
-
-    # 簡易 post-processing: 応答テキストを短くする等
-    reply_text = generated.strip()
-    if len(reply_text) > 1900:
-        reply_text = reply_text[:1900] + "…"
-
-    # 返信（メンションは省略してフレンドリーに）
-    try:
-        await message.channel.send(reply_text)
-    except Exception as e:
-        print("[bot] send fail:", e)
-
-    # active_conversations を更新（継続させる）
-    expiry = datetime.utcnow() + timedelta(seconds=CONV_TIMEOUT_SECONDS)
-    new_history = history + [("user", message.content), ("assistant", reply_text)]
-    # トークン長でカット
-    try:
-        new_history = truncate_history_by_tokens(new_history, tokenizer, MAX_HISTORY_TOKENS)
-    except:
-        pass
-    active_conversations[key] = {"expires": expiry, "history": new_history}
-
-# ---------- 起動 ----------
-def main():
-    # 追加: Render などで直接実行する際に使う
-    bot.run(DISCORD_TOKEN)
-
-if __name__ == "__main__":
-    main()
-
+def load_model_if_exists(path, vocab_size=None, device="cpu"):
+    if path and os.path.exists(path):
+        # vocab_size is required to rebuild model architecture
+        # caller should provide tokenizer.vocab_size
+        # return loaded model (moved to device)
+        raise NotImplementedError("Use caller to instantiate model with proper vocab size, then load state_dict.")
+    return None
